@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>משרד עורכי דין — עוזר AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">L</div>
+        <div>
+          <div class="brand-name">Lawyer.io</div>
+          <div class="brand-sub">נדל"ן · עו"ד</div>
+        </div>
+      </div>
+
+      <div class="mode-switch" role="tablist" aria-label="סוג משתמש">
+        <button class="mode-btn active" data-mode="client" role="tab" aria-selected="true">לקוח</button>
+        <button class="mode-btn" data-mode="lawyer" role="tab" aria-selected="false">צוות המשרד</button>
+      </div>
+
+      <nav class="sidebar-section">
+        <h3>כלים מהירים</h3>
+        <ul class="quick-list" id="quickTools">
+          <!-- populated by app.js -->
+        </ul>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button id="resetBtn" class="ghost-btn">התחל שיחה חדשה</button>
+      </div>
+    </aside>
+
+    <main class="chat">
+      <header class="chat-header">
+        <h1>עוזר AI משפטי — נדל"ן בישראל</h1>
+        <p class="subtitle">שירות מידע בלבד — אינו מהווה ייעוץ משפטי מחייב.</p>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite">
+        <div class="msg ai">
+          <div class="bubble">
+            שלום! אני העוזר של המשרד. אפשר לשאול אותי מה להביא לפגישה, איך עובד תהליך רישום בטאבו, או כל שאלה נדל"נית אחרת. אם את/ה עורך/ת דין או איש/ת צוות, לחצו על "צוות המשרד" בתפריט.
+          </div>
+        </div>
+      </section>
+
+      <div class="chips" id="suggestedChips" aria-label="הצעות לשאלה"></div>
+
+      <form id="chatForm" class="composer" autocomplete="off">
+        <textarea id="input" placeholder="כתוב/י שאלה..." rows="1" aria-label="שדה הודעה"></textarea>
+        <button type="submit" id="sendBtn" class="send-btn" aria-label="שלח">
+          <span>שלח</span>
+        </button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
