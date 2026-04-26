@@ -11,16 +11,15 @@ import (
 	"time"
 )
 
-// fakeAPI returns a canned JSON response shaped like data.gov.il's
-// datastore_search endpoint.
+// fakeAPI returns a canned JSON response shaped like data.gov.il's endpoints.
+// It accepts either a ?sql= param (SQL endpoint) or ?q= param (q= endpoint).
 func fakeAPI(t *testing.T, records []map[string]interface{}) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("resource_id"); got == "" {
-			t.Errorf("resource_id query param missing")
-		}
-		if got := r.URL.Query().Get("q"); got == "" {
-			t.Errorf("q query param missing")
+		hasSql := r.URL.Query().Get("sql") != ""
+		hasQ := r.URL.Query().Get("q") != ""
+		if !hasSql && !hasQ {
+			t.Errorf("expected either sql or q query param, got neither")
 		}
 		io.Copy(io.Discard, r.Body)
 		w.Header().Set("content-type", "application/json")
@@ -41,7 +40,7 @@ func TestFetchByCity_HappyPath(t *testing.T) {
 	records := []map[string]interface{}{
 		{"שם_ישוב": "תל אביב", "מחיר": float64(3200000), "שטח": float64(90), "חדרים": float64(4), "תאריך_עסקה": "2026-03-15"},
 		{"שם_ישוב": "תל אביב", "מחיר": "2,800,000", "שטח": float64(70), "חדרים": float64(3), "תאריך_עסקה": "2026-02-01"},
-		// out of window
+		// out of 6-month window (keep WithLookbackMonths(6) so this stays outside)
 		{"שם_ישוב": "תל אביב", "מחיר": float64(2500000), "שטח": float64(60), "חדרים": float64(3), "תאריך_עסקה": "2025-01-01"},
 		// wrong city
 		{"שם_ישוב": "חיפה", "מחיר": float64(2000000), "שטח": float64(80), "חדרים": float64(4), "תאריך_עסקה": "2026-04-01"},
@@ -53,6 +52,7 @@ func TestFetchByCity_HappyPath(t *testing.T) {
 
 	f := New(
 		WithBaseURL(srv.URL),
+		WithSQLBaseURL(srv.URL),
 		WithNow(fixedNow),
 		WithLookbackMonths(6),
 	)
@@ -86,7 +86,8 @@ func TestFetchByCity_APIFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := New(WithBaseURL(srv.URL))
+	// Both SQL and q= endpoints point at the failing server.
+	f := New(WithBaseURL(srv.URL), WithSQLBaseURL(srv.URL))
 	_, err := f.FetchByCity(context.Background(), "חיפה")
 	if err == nil {
 		t.Fatal("expected error on 500")
@@ -99,13 +100,70 @@ func TestFetchByCity_SuccessFalse(t *testing.T) {
 		_, _ = w.Write([]byte(`{"success":false}`))
 	}))
 	defer srv.Close()
-	f := New(WithBaseURL(srv.URL))
+	f := New(WithBaseURL(srv.URL), WithSQLBaseURL(srv.URL))
 	_, err := f.FetchByCity(context.Background(), "חיפה")
 	if err == nil {
 		t.Fatal("expected error when success=false")
 	}
 	if !strings.Contains(err.Error(), "success=false") {
 		t.Errorf("error should mention success=false, got: %v", err)
+	}
+}
+
+func TestFetchByCity_TelAvivAlias(t *testing.T) {
+	// Dataset stores Tel Aviv as "תל אביב יפו"; user types "תל אביב".
+	records := []map[string]interface{}{
+		{
+			"FULLADRESS":   "תל אביב יפו רחוב דיזנגוף 1",
+			"DEALAMOUNT":   float64(4000000),
+			"ASSETNETAREA": float64(90),
+			"DEALDATETIME": "2026-03-01T00:00:00",
+		},
+	}
+	srv := fakeAPI(t, records)
+	defer srv.Close()
+
+	f := New(
+		WithBaseURL(srv.URL),
+		WithSQLBaseURL(srv.URL),
+		WithNow(fixedNow),
+		WithLookbackMonths(24),
+	)
+	recs, err := f.FetchByCity(context.Background(), "תל אביב")
+	if err != nil {
+		t.Fatalf("FetchByCity: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 record for Tel Aviv alias, got %d", len(recs))
+	}
+	if recs[0].Price != 4000000 {
+		t.Errorf("price = %v", recs[0].Price)
+	}
+}
+
+func TestFetchByCity_Cache(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"result":  map[string]interface{}{"records": []map[string]interface{}{}},
+		})
+	}))
+	defer srv.Close()
+
+	f := New(
+		WithBaseURL(srv.URL),
+		WithSQLBaseURL(srv.URL),
+		WithNow(fixedNow),
+		WithCacheTTL(10*time.Minute),
+	)
+	_, _ = f.FetchByCity(context.Background(), "חיפה")
+	_, _ = f.FetchByCity(context.Background(), "חיפה")
+	if callCount != 1 {
+		t.Errorf("expected 1 HTTP call (second should hit cache), got %d", callCount)
 	}
 }
 
@@ -163,7 +221,7 @@ func TestSummaryForCity_EndToEnd(t *testing.T) {
 	srv := fakeAPI(t, records)
 	defer srv.Close()
 
-	f := New(WithBaseURL(srv.URL), WithNow(fixedNow))
+	f := New(WithBaseURL(srv.URL), WithSQLBaseURL(srv.URL), WithNow(fixedNow))
 	out, err := f.SummaryForCity(context.Background(), "רמת גן")
 	if err != nil {
 		t.Fatalf("SummaryForCity: %v", err)
@@ -180,7 +238,7 @@ func TestNormalize_AlternateFieldNames(t *testing.T) {
 	row := map[string]interface{}{
 		"FULLADRESS":   "תל אביב יפו רחוב X",
 		"DEALAMOUNT":   "2,500,000",
-		"DEALNATURE":   float64(75),
+		"ASSETNETAREA": float64(75), // DEALNATURE is a string description, not area
 		"DEALDATETIME": "2026-03-01T00:00:00",
 	}
 	r := normalize(row)
@@ -191,20 +249,35 @@ func TestNormalize_AlternateFieldNames(t *testing.T) {
 		t.Errorf("price not parsed from string: %v", r.Price)
 	}
 	if r.AreaSqm != 75 {
-		t.Errorf("area not picked up: %v", r.AreaSqm)
+		t.Errorf("area not picked up from ASSETNETAREA: %v", r.AreaSqm)
 	}
 	if r.DealDate.Year() != 2026 {
 		t.Errorf("date not parsed: %v", r.DealDate)
 	}
 }
 
+func TestNormalize_AssetNetArea(t *testing.T) {
+	// DEALNATURE is a deal-type description string — must NOT be parsed as area.
+	row := map[string]interface{}{
+		"FULLADRESS":   "חיפה רחוב הנמל 5",
+		"DEALAMOUNT":   float64(2000000),
+		"ASSETNETAREA": float64(80),
+		"DEALNATURE":   "דירה", // string — should be ignored for area
+		"DEALDATETIME": "2026-01-01T00:00:00",
+	}
+	r := normalize(row)
+	if r.AreaSqm != 80 {
+		t.Errorf("expected AreaSqm=80 from ASSETNETAREA, got %v", r.AreaSqm)
+	}
+}
+
 func TestFormatILS_Thousands(t *testing.T) {
 	cases := map[float64]string{
-		0:           "0",
-		123:         "123",
-		1234:        "1,234",
-		1234567:     "1,234,567",
-		1234567.89:  "1,234,568", // rounded
+		0:          "0",
+		123:        "123",
+		1234:       "1,234",
+		1234567:    "1,234,567",
+		1234567.89: "1,234,568", // rounded
 	}
 	for in, want := range cases {
 		if got := formatILS(in); got != want {

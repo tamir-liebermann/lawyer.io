@@ -1,16 +1,10 @@
 // Package realestatedata queries the public data.gov.il datastore for
 // Israeli real estate transactions.
 //
-// Dataset resource ID comes from CLAUDE.md:
+// Primary endpoint: datastore_search_sql (LIKE query by FULLADRESS).
+// Fallback endpoint: datastore_search with q= full-text search.
 //
-//	5c78e9fa-c2e2-4771-93ff-7f400a12f7ba
-//
-// The datastore_search endpoint returns JSON of the form:
-//
-//	{ "success": true, "result": { "records": [ {...}, ... ] } }
-//
-// Field names vary across dataset revisions; this package normalizes the
-// subset we care about (city, price, deal date, rooms, area in sqm).
+// Dataset resource ID: 5c78e9fa-c2e2-4771-93ff-7f400a12f7ba
 package realestatedata
 
 import (
@@ -18,53 +12,85 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	DefaultBaseURL    = "https://data.gov.il/api/3/action/datastore_search"
+	DefaultSQLBaseURL = "https://data.gov.il/api/3/action/datastore_search_sql"
 	DefaultResourceID = "5c78e9fa-c2e2-4771-93ff-7f400a12f7ba"
 	DefaultLimit      = 500
 )
 
+// cityAliases maps colloquial Hebrew city names to the official name stored
+// in the data.gov.il dataset. Tel Aviv is stored as "תל אביב יפו" (merged
+// municipality), not the commonly typed "תל אביב".
+var cityAliases = map[string]string{
+	"תל אביב":     "תל אביב יפו",
+	"תל-אביב":     "תל אביב יפו",
+	"תל אביב-יפו": "תל אביב יפו",
+	"פתח תקוה":    "פתח תקווה",
+}
+
+// resolveCity returns the canonical dataset city name, or the input unchanged.
+func resolveCity(city string) string {
+	if canonical, ok := cityAliases[city]; ok {
+		return canonical
+	}
+	return city
+}
+
+type cacheEntry struct {
+	records   []Record
+	expiresAt time.Time
+}
+
 // Fetcher queries the data.gov.il datastore.
 type Fetcher struct {
-	baseURL    string
-	resourceID string
-	limit      int
-	http       *http.Client
-	// months to look back when filtering transactions. Default 6.
+	baseURL        string
+	sqlBaseURL     string
+	resourceID     string
+	limit          int
+	http           *http.Client
 	lookbackMonths int
-	// now is injectable for deterministic tests.
-	now func() time.Time
+	now            func() time.Time
+
+	cacheMu  sync.Mutex
+	cache    map[string]cacheEntry
+	cacheTTL time.Duration
 }
 
 // Option configures a Fetcher.
 type Option func(*Fetcher)
 
-func WithBaseURL(u string) Option       { return func(f *Fetcher) { f.baseURL = u } }
-func WithResourceID(id string) Option   { return func(f *Fetcher) { f.resourceID = id } }
-func WithLimit(n int) Option            { return func(f *Fetcher) { f.limit = n } }
-func WithHTTPClient(h *http.Client) Option {
-	return func(f *Fetcher) { f.http = h }
-}
-func WithLookbackMonths(n int) Option   { return func(f *Fetcher) { f.lookbackMonths = n } }
+func WithBaseURL(u string) Option        { return func(f *Fetcher) { f.baseURL = u } }
+func WithSQLBaseURL(u string) Option     { return func(f *Fetcher) { f.sqlBaseURL = u } }
+func WithResourceID(id string) Option    { return func(f *Fetcher) { f.resourceID = id } }
+func WithLimit(n int) Option             { return func(f *Fetcher) { f.limit = n } }
+func WithHTTPClient(h *http.Client) Option { return func(f *Fetcher) { f.http = h } }
+func WithLookbackMonths(n int) Option    { return func(f *Fetcher) { f.lookbackMonths = n } }
 func WithNow(fn func() time.Time) Option { return func(f *Fetcher) { f.now = fn } }
+func WithCacheTTL(d time.Duration) Option { return func(f *Fetcher) { f.cacheTTL = d } }
 
 // New constructs a Fetcher with sensible defaults.
 func New(opts ...Option) *Fetcher {
 	f := &Fetcher{
 		baseURL:        DefaultBaseURL,
+		sqlBaseURL:     DefaultSQLBaseURL,
 		resourceID:     DefaultResourceID,
 		limit:          DefaultLimit,
 		http:           &http.Client{Timeout: 10 * time.Second},
-		lookbackMonths: 6,
+		lookbackMonths: 24, // extended; dataset has 2-3 month reporting lag
 		now:            time.Now,
+		cache:          make(map[string]cacheEntry),
+		cacheTTL:       10 * time.Minute,
 	}
 	for _, o := range opts {
 		o(f)
@@ -96,29 +122,100 @@ type rawResult struct {
 	} `json:"result"`
 }
 
+// sqlQueryTemplate is used by fetchSQL. %s = resource_id, %s = city fragment, %d = limit.
+const sqlQueryTemplate = `SELECT * FROM "%s" WHERE "FULLADRESS" LIKE '%%%s%%' LIMIT %d`
+
 // FetchByCity returns normalized records for the given Hebrew city name,
-// restricted to the configured lookback window.
+// restricted to the configured lookback window. It resolves city aliases,
+// checks the in-memory TTL cache, then tries the SQL endpoint (LIKE query)
+// before falling back to the generic q= full-text approach.
 func (f *Fetcher) FetchByCity(ctx context.Context, city string) ([]Record, error) {
 	city = strings.TrimSpace(city)
 	if city == "" {
 		return nil, fmt.Errorf("realestatedata: empty city")
 	}
 
+	canonical := resolveCity(city)
+
+	if recs, ok := f.fromCache(canonical); ok {
+		log.Printf("realestatedata: cache hit for %q (%d records)", canonical, len(recs))
+		return recs, nil
+	}
+
+	recs, err := f.fetchSQL(ctx, canonical)
+	if err != nil {
+		log.Printf("realestatedata: SQL fetch failed for %q: %v; falling back to q=", canonical, err)
+		recs, err = f.fetchQ(ctx, canonical)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	log.Printf("realestatedata: raw records for %q: %d", canonical, len(recs))
+
+	cutoff := f.now().AddDate(0, -f.lookbackMonths, 0)
+	out := f.filterRecords(recs, city, canonical, cutoff)
+
+	f.toCache(canonical, out)
+	return out, nil
+}
+
+// filterRecords applies city, date, and price filters with detailed logging.
+// It accepts both the original city name and the canonical alias so that test
+// data using the short form (e.g., "תל אביב") still matches.
+func (f *Fetcher) filterRecords(recs []Record, original, canonical string, cutoff time.Time) []Record {
+	out := make([]Record, 0, len(recs))
+	noCityMatch, noPrice := 0, 0
+	for _, r := range recs {
+		if r.City != "" &&
+			!strings.Contains(r.City, canonical) &&
+			!strings.Contains(r.City, original) {
+			noCityMatch++
+			continue
+		}
+		if !r.DealDate.IsZero() && r.DealDate.Before(cutoff) {
+			continue
+		}
+		if r.Price <= 0 {
+			noPrice++
+			continue
+		}
+		out = append(out, r)
+	}
+	log.Printf("realestatedata: filter stats for %q — cityMismatch=%d noPrice=%d kept=%d (cutoff=%s)",
+		canonical, noCityMatch, noPrice, len(out), cutoff.Format("2006-01-02"))
+	return out
+}
+
+func (f *Fetcher) fetchSQL(ctx context.Context, canonical string) ([]Record, error) {
+	if f.sqlBaseURL == "" {
+		return nil, fmt.Errorf("realestatedata: SQL base URL not set")
+	}
+	sqlStr := fmt.Sprintf(sqlQueryTemplate, f.resourceID, canonical, f.limit)
+	q := url.Values{}
+	q.Set("sql", sqlStr)
+	u := f.sqlBaseURL + "?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("realestatedata: new SQL request: %w", err)
+	}
+	return f.doFetch(req)
+}
+
+func (f *Fetcher) fetchQ(ctx context.Context, canonical string) ([]Record, error) {
 	q := url.Values{}
 	q.Set("resource_id", f.resourceID)
 	q.Set("limit", strconv.Itoa(f.limit))
-	// datastore_search accepts a JSON filters param. The dataset uses the
-	// Hebrew field name "שם_ישוב"; some revisions use "FULLADRESS". We pass
-	// the city via the generic `q` parameter which triggers a full-text
-	// search — that works across revisions.
-	q.Set("q", city)
-
+	q.Set("q", canonical)
 	u := f.baseURL + "?" + q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("realestatedata: new request: %w", err)
 	}
+	return f.doFetch(req)
+}
 
+func (f *Fetcher) doFetch(req *http.Request) ([]Record, error) {
 	resp, err := f.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("realestatedata: http: %w", err)
@@ -141,23 +238,30 @@ func (f *Fetcher) FetchByCity(ctx context.Context, city string) ([]Record, error
 		return nil, fmt.Errorf("realestatedata: API returned success=false")
 	}
 
-	cutoff := f.now().AddDate(0, -f.lookbackMonths, 0)
 	out := make([]Record, 0, len(raw.Result.Records))
 	for _, row := range raw.Result.Records {
-		r := normalize(row)
-		// Only keep rows mentioning our city (q may match other fields too).
-		if r.City != "" && !strings.Contains(r.City, city) {
-			continue
-		}
-		if !r.DealDate.IsZero() && r.DealDate.Before(cutoff) {
-			continue
-		}
-		if r.Price <= 0 {
-			continue
-		}
-		out = append(out, r)
+		out = append(out, normalize(row))
 	}
 	return out, nil
+}
+
+func (f *Fetcher) fromCache(canonical string) ([]Record, bool) {
+	f.cacheMu.Lock()
+	defer f.cacheMu.Unlock()
+	e, ok := f.cache[canonical]
+	if !ok || f.now().After(e.expiresAt) {
+		return nil, false
+	}
+	return e.records, true
+}
+
+func (f *Fetcher) toCache(canonical string, recs []Record) {
+	f.cacheMu.Lock()
+	defer f.cacheMu.Unlock()
+	f.cache[canonical] = cacheEntry{
+		records:   recs,
+		expiresAt: f.now().Add(f.cacheTTL),
+	}
 }
 
 // Summary collapses a record slice into the numbers we feed to Claude.
@@ -204,10 +308,14 @@ func Summarize(city string, records []Record) Summary {
 // for injection into the system prompt.
 func FormatSummaryHebrew(s Summary) string {
 	if s.Count == 0 {
-		return fmt.Sprintf("לא נמצאו עסקאות ב-%s בחצי השנה האחרונה במאגר הציבורי.", s.City)
+		return fmt.Sprintf(
+			"לא נמצאו עסקאות ב-%s בשנתיים האחרונות במאגר הציבורי (שים לב: יש פיגור דיווח של 2-3 חודשים).",
+			s.City,
+		)
 	}
 	return fmt.Sprintf(
-		"נתוני עסקאות עדכניים ב-%s (חצי שנה אחרונה): מספר עסקאות: %d; מחיר ממוצע: %s ₪; טווח: %s–%s ₪; מחיר ממוצע למ\"ר: %s ₪.",
+		"נתוני עסקאות ב-%s (עד שנתיים אחרונות, פיגור דיווח 2-3 חודשים): "+
+			"מספר עסקאות: %d; מחיר ממוצע: %s ₪; טווח: %s–%s ₪; מחיר ממוצע למ\"ר: %s ₪.",
 		s.City,
 		s.Count,
 		formatILS(s.AvgPrice),
@@ -230,12 +338,13 @@ func (f *Fetcher) SummaryForCity(ctx context.Context, city string) (string, erro
 // --- helpers ---
 
 // normalize tolerates the dataset's inconsistent field names.
+// DEALNATURE is the deal-type description (e.g., "דירה"), not sqm — use ASSETNETAREA.
 func normalize(row map[string]interface{}) Record {
 	var r Record
 	r.City = firstString(row, "שם_ישוב", "FULLADRESS", "YISHUV", "city")
 	r.Price = firstFloat(row, "מחיר", "DEALAMOUNT", "price", "TransactionSum")
-	r.Rooms = firstFloat(row, "חדרים", "ROOMS", "rooms")
-	r.AreaSqm = firstFloat(row, "שטח", "DEALNATURE", "area", "DealNatureArea")
+	r.Rooms = firstFloat(row, "חדרים", "ASSETROOMSNUM", "ROOMS", "rooms")
+	r.AreaSqm = firstFloat(row, "שטח", "ASSETNETAREA", "area", "DealNatureArea")
 	if d := firstString(row, "תאריך_עסקה", "DEALDATETIME", "dealDate", "date"); d != "" {
 		r.DealDate = parseDate(d)
 	}
@@ -303,7 +412,6 @@ func formatILS(v float64) string {
 		i = -i
 	}
 	digits := []byte(strconv.FormatInt(i, 10))
-	// insert commas every 3 from the right.
 	var out []byte
 	for idx, ch := range digits {
 		if idx > 0 && (len(digits)-idx)%3 == 0 {
@@ -317,7 +425,7 @@ func formatILS(v float64) string {
 	return string(out)
 }
 
-// Sort by DealDate descending. Exposed for completeness / tests.
+// SortByDateDesc sorts records by DealDate descending.
 func SortByDateDesc(rs []Record) {
 	sort.SliceStable(rs, func(i, j int) bool { return rs[i].DealDate.After(rs[j].DealDate) })
 }
