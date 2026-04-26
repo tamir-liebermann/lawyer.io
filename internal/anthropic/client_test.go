@@ -118,8 +118,8 @@ func TestClient_Chat_JoinsMultipleTextBlocks(t *testing.T) {
 }
 
 func TestBuildSystemPrompt_SelectsAddendum(t *testing.T) {
-	client := BuildSystemPrompt("client", "")
-	lawyer := BuildSystemPrompt("lawyer", "")
+	client := BuildSystemPrompt("client", "", "")
+	lawyer := BuildSystemPrompt("lawyer", "", "")
 	if !strings.Contains(client, "מצב נוכחי: לקוח") {
 		t.Error("client addendum missing")
 	}
@@ -132,14 +132,14 @@ func TestBuildSystemPrompt_SelectsAddendum(t *testing.T) {
 }
 
 func TestBuildSystemPrompt_InjectsRealEstateContext(t *testing.T) {
-	got := BuildSystemPrompt("lawyer", "נתונים על גבעתיים: 15 עסקאות")
+	got := BuildSystemPrompt("lawyer", "", "נתונים על גבעתיים: 15 עסקאות")
 	if !strings.Contains(got, "נתונים על גבעתיים") {
 		t.Error("real-estate context not injected")
 	}
 }
 
 func TestBuildSystemPrompt_DefaultsToClient(t *testing.T) {
-	got := BuildSystemPrompt("", "")
+	got := BuildSystemPrompt("", "", "")
 	if !strings.Contains(got, "מצב נוכחי: לקוח") {
 		t.Error("empty user type should default to client mode")
 	}

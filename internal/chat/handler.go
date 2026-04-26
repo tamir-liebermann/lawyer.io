@@ -27,10 +27,11 @@ type RealEstateFetcher interface {
 // Handler wires session storage, the LLM client, and the real-estate fetcher
 // into the HTTP /api/chat endpoint.
 type Handler struct {
-	Sessions  *SessionStore
-	LLM       ChatClient
-	RealEstat RealEstateFetcher // optional; may be nil
-	Logger    *log.Logger
+	Sessions    *SessionStore
+	LLM         ChatClient
+	RealEstat   RealEstateFetcher // optional; may be nil
+	OfficeName  string            // injected from OFFICE_NAME env var
+	Logger      *log.Logger
 	// ChatTimeout bounds each LLM round-trip. Default 45s if zero.
 	ChatTimeout time.Duration
 }
@@ -89,24 +90,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	userType := UserType(sess)
 	sid := SID(sess)
 
-	// Optional server-side enrichment: if the user message looks like a
-	// real-estate market question AND we have a fetcher, try to inject
-	// a short summary as system context.
+	// Start real-estate fetch in background; we wait at most 2.5s so that
+	// even a cache miss can complete before we build the system prompt.
+	// Using context.Background() (not r.Context()) so a cancelled request
+	// doesn't abort a fetch that's about to populate the cache.
 	var reContext string
 	if h.RealEstat != nil {
 		if city := detectCityQuery(req.Message); city != "" {
-			ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
-			s, err := h.RealEstat.SummaryForCity(ctx, city)
-			cancel()
-			if err != nil {
-				h.logf("real-estate summary for %q: %v", city, err)
-			} else {
-				reContext = s
+			type reResult struct {
+				summary string
+				err     error
+			}
+			reCh := make(chan reResult, 1)
+			go func() {
+				ctx2, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+				defer cancel()
+				s, err := h.RealEstat.SummaryForCity(ctx2, city)
+				reCh <- reResult{s, err}
+			}()
+			select {
+			case res := <-reCh:
+				if res.err != nil {
+					h.logf("real-estate summary for %q: %v", city, res.err)
+				} else {
+					reContext = res.summary
+				}
+			case <-time.After(2500 * time.Millisecond):
+				h.logf("real-estate fetch for %q timed out; proceeding without context", city)
 			}
 		}
 	}
 
-	system := anthropic.BuildSystemPrompt(userType, reContext)
+	system := anthropic.BuildSystemPrompt(userType, h.OfficeName, reContext)
 	history := h.Sessions.History(sid)
 
 	ctx := r.Context()
