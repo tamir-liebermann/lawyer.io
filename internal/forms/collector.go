@@ -10,6 +10,7 @@
 package forms
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -140,8 +141,9 @@ func (c *Collector) Get(key string) (string, bool) {
 }
 
 // MissingFields returns the keys of required fields that haven't been filled.
+// Always returns a non-nil slice so JSON serialization produces [] not null.
 func (c *Collector) MissingFields() []string {
-	var out []string
+	out := make([]string, 0)
 	for _, f := range c.form.Fields {
 		if !f.Required {
 			continue
@@ -189,6 +191,20 @@ func (c *Collector) SummaryHebrew() string {
 		b.WriteString("• " + f.LabelHE + ": " + v + "\n")
 	}
 	return b.String()
+}
+
+// ToJSON serializes the collected values and form metadata as JSON.
+func (c *Collector) ToJSON() ([]byte, error) {
+	type export struct {
+		FormID   string            `json:"form_id"`
+		FormName string            `json:"form_name"`
+		Values   map[string]string `json:"values"`
+	}
+	return json.Marshal(export{
+		FormID:   c.form.ID,
+		FormName: c.form.NameHE,
+		Values:   c.values,
+	})
 }
 
 // validate enforces very light type rules. Intentionally lenient — the

@@ -9,14 +9,39 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/lawyer-io/lawyer/internal/anthropic"
+	"github.com/lawyer-io/lawyer/internal/booking"
 	"github.com/lawyer-io/lawyer/internal/chat"
 	"github.com/lawyer-io/lawyer/internal/forms"
 	"github.com/lawyer-io/lawyer/internal/realestatedata"
 )
+
+// staticDir is the directory the Vite build writes to. Go serves it as-is.
+const staticDir = "web/static"
+
+// officeConfig holds the configurable details of the law office.
+type officeConfig struct {
+	Name    string `json:"name"`
+	Address string `json:"address"`
+	Phone   string `json:"phone"`
+	Email   string `json:"email"`
+	Hours   string `json:"hours"`
+}
+
+func loadOfficeConfig() officeConfig {
+	return officeConfig{
+		Name:    getenv("OFFICE_NAME", "Lawyer.io"),
+		Address: getenv("OFFICE_ADDRESS", ""),
+		Phone:   getenv("OFFICE_PHONE", ""),
+		Email:   getenv("OFFICE_EMAIL", ""),
+		Hours:   getenv("OFFICE_HOURS", ""),
+	}
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -36,6 +61,17 @@ func run() error {
 		secret = "dev-only-session-secret-please-change-me"
 	}
 
+	office := loadOfficeConfig()
+	bookingSvc := booking.New(booking.Config{
+		ServiceAccountJSON: getenv("GOOGLE_SERVICE_ACCOUNT_JSON", ""),
+		CalendarID:         getenv("GOOGLE_CALENDAR_ID", ""),
+		SMTPHost:           getenv("SMTP_HOST", ""),
+		SMTPPort:           getenv("SMTP_PORT", "587"),
+		SMTPUser:           getenv("SMTP_USER", ""),
+		SMTPPass:           getenv("SMTP_PASS", ""),
+		OfficeEmail:        office.Email,
+		OfficeName:         office.Name,
+	})
 	sessStore := chat.NewSessionStore([]byte(secret))
 	llm := anthropic.NewClient(apiKey)
 	reFetcher := realestatedata.New()
@@ -44,6 +80,7 @@ func run() error {
 		Sessions:    sessStore,
 		LLM:         llm,
 		RealEstat:   reFetcher,
+		OfficeName:  office.Name,
 		Logger:      logger,
 		ChatTimeout: 45 * time.Second,
 	}
@@ -53,11 +90,14 @@ func run() error {
 	mux.HandleFunc("/api/reset", handler.ResetHandler)
 	mux.HandleFunc("/api/mode", handler.ModeHandler)
 	mux.HandleFunc("/api/forms", formsHandler)
+	mux.HandleFunc("/api/forms/extract", formExtractHandler(llm))
 	mux.HandleFunc("/api/realestate", realEstateHandler(reFetcher))
+	mux.HandleFunc("/api/office", officeHandler(office))
+	mux.HandleFunc("/api/book", bookHandler(bookingSvc))
 	mux.HandleFunc("/healthz", healthz)
 
-	// Static assets + default root.
-	mux.Handle("/", http.FileServer(http.Dir("web/static")))
+	// Static assets + SPA fallback for the React client.
+	mux.Handle("/", spaHandler(staticDir))
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -88,6 +128,101 @@ func run() error {
 	<-idle
 	logger.Println("server stopped")
 	return nil
+}
+
+func bookHandler(svc *booking.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req booking.Request
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil {
+			http.Error(w, "בקשה לא תקינה", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Date) == "" || strings.TrimSpace(req.Time) == "" {
+			http.Error(w, "שם, תאריך ושעה הם שדות חובה", http.StatusBadRequest)
+			return
+		}
+		if err := svc.Book(r.Context(), req); err != nil {
+			log.Printf("book: %v", err)
+			http.Error(w, "שגיאה בקביעת הפגישה, נסה שוב", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("content-type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}
+}
+
+func formExtractHandler(llm *anthropic.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			FormID   string `json:"form_id"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+			http.Error(w, "בקשה לא תקינה", http.StatusBadRequest)
+			return
+		}
+		form, ok := forms.FindForm(body.FormID)
+		if !ok {
+			http.Error(w, "טופס לא נמצא", http.StatusBadRequest)
+			return
+		}
+
+		var sb strings.Builder
+		for _, m := range body.Messages {
+			role := "משתמש"
+			if m.Role == "assistant" {
+				role = "עוזר"
+			}
+			sb.WriteString(role + ": " + m.Content + "\n\n")
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+
+		extracted, err := forms.Extract(ctx, llm, form, sb.String())
+		if err != nil {
+			log.Printf("forms extract: %v", err)
+			http.Error(w, "שגיאה בחילוץ הנתונים", http.StatusInternalServerError)
+			return
+		}
+
+		coll, _ := forms.NewCollector(form.ID)
+		for k, v := range extracted {
+			_ = coll.Set(k, v)
+		}
+
+		resp := map[string]interface{}{
+			"form_id":   form.ID,
+			"form_name": form.NameHE,
+			"values":    extracted,
+			"missing":   coll.MissingFields(),
+			"summary":   coll.SummaryHebrew(),
+		}
+		w.Header().Set("content-type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func officeHandler(cfg officeConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("content-type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(cfg)
+	}
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
@@ -129,6 +264,45 @@ func realEstateHandler(f *realestatedata.Fetcher) http.HandlerFunc {
 		w.Header().Set("content-type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"city": city, "summary": summary})
 	}
+}
+
+// spaHandler serves files from dir when they exist and otherwise falls back
+// to index.html so client-side routes resolve against the React app. API
+// paths (/api/...) are never handled here — they are registered on the mux
+// before the catch-all "/".
+func spaHandler(dir string) http.Handler {
+	fs := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Defensive: if /api slipped through, let it 404 rather than return HTML.
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+		// Normalise the path and check whether it points to an existing file.
+		clean := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+		if clean == "." || clean == "/" {
+			serveIndex(w, r, dir)
+			return
+		}
+		full := filepath.Join(dir, clean)
+		info, err := os.Stat(full)
+		if err != nil || info.IsDir() {
+			serveIndex(w, r, dir)
+			return
+		}
+		fs.ServeHTTP(w, r)
+	})
+}
+
+func serveIndex(w http.ResponseWriter, r *http.Request, dir string) {
+	index := filepath.Join(dir, "index.html")
+	if _, err := os.Stat(index); err != nil {
+		http.Error(w, "client bundle missing; run: cd web/client && npm run build", http.StatusInternalServerError)
+		return
+	}
+	// Disable caching for the shell so users pick up new bundles promptly.
+	w.Header().Set("Cache-Control", "no-cache")
+	http.ServeFile(w, r, index)
 }
 
 func securityHeaders(h http.Handler) http.Handler {

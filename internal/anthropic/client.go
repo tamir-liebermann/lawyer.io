@@ -18,7 +18,7 @@ const (
 	DefaultBaseURL = "https://api.anthropic.com"
 	DefaultModel   = "claude-sonnet-4-20250514"
 	APIVersion     = "2023-06-01"
-	DefaultMaxTok  = 1024
+	DefaultMaxTok  = 2048
 )
 
 // Message is a single turn in the conversation history.
@@ -74,9 +74,51 @@ type messagesRequest struct {
 	Messages  []Message `json:"messages"`
 }
 
-type contentBlock struct {
+type toolChoice struct {
 	Type string `json:"type"`
-	Text string `json:"text"`
+}
+
+type messagesRequestWithTools struct {
+	Model      string     `json:"model"`
+	MaxTokens  int        `json:"max_tokens"`
+	System     string     `json:"system,omitempty"`
+	Messages   []Message  `json:"messages"`
+	Tools      []Tool     `json:"tools"`
+	ToolChoice toolChoice `json:"tool_choice"`
+}
+
+type contentBlock struct {
+	Type  string                 `json:"type"`
+	Text  string                 `json:"text,omitempty"`
+	ID    string                 `json:"id,omitempty"`
+	Name  string                 `json:"name,omitempty"`
+	Input map[string]interface{} `json:"input,omitempty"`
+}
+
+// ToolProperty describes a single property in a tool's input schema.
+type ToolProperty struct {
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+}
+
+// ToolInputSchema is the JSON Schema for a tool's input.
+type ToolInputSchema struct {
+	Type       string                  `json:"type"`
+	Properties map[string]ToolProperty `json:"properties"`
+	Required   []string                `json:"required,omitempty"`
+}
+
+// Tool defines a callable function that Claude can invoke.
+type Tool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema ToolInputSchema `json:"input_schema"`
+}
+
+// ToolUseResult holds the tool name and parsed input from a tool_use response.
+type ToolUseResult struct {
+	ToolName string
+	Input    map[string]interface{}
 }
 
 type apiError struct {
@@ -151,4 +193,63 @@ func (c *Client) Chat(ctx context.Context, system string, history []Message, use
 		}
 	}
 	return out.String(), nil
+}
+
+// ExtractWithTool sends the messages with a single tool definition and returns
+// the tool_use result. Returns nil result (no error) when the model responds
+// with text instead of a tool call.
+func (c *Client) ExtractWithTool(ctx context.Context, system string, msgs []Message, tool Tool) (*ToolUseResult, error) {
+	if c.apiKey == "" {
+		return nil, ErrMissingAPIKey
+	}
+
+	reqBody := messagesRequestWithTools{
+		Model:      c.model,
+		MaxTokens:  1024,
+		System:     system,
+		Messages:   msgs,
+		Tools:      []Tool{tool},
+		ToolChoice: toolChoice{Type: "auto"},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: new request: %w", err)
+	}
+	req.Header.Set("x-api-key", c.apiKey)
+	req.Header.Set("anthropic-version", APIVersion)
+	req.Header.Set("content-type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: read body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("anthropic: API error status=%d body=%s", resp.StatusCode, string(respBody))
+	}
+
+	var mr messagesResponse
+	if err := json.Unmarshal(respBody, &mr); err != nil {
+		return nil, fmt.Errorf("anthropic: decode response: %w (body=%s)", err, string(respBody))
+	}
+	if mr.Error != nil {
+		return nil, fmt.Errorf("anthropic: %s: %s", mr.Error.Type, mr.Error.Message)
+	}
+
+	for _, b := range mr.Content {
+		if b.Type == "tool_use" {
+			return &ToolUseResult{ToolName: b.Name, Input: b.Input}, nil
+		}
+	}
+	return nil, nil
 }
