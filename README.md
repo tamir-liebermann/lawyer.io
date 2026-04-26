@@ -8,16 +8,29 @@ data.gov.il datastore for market data.
 
 ## Quick start
 
+### Prerequisites
+
+- Go 1.22+
+- Node.js 18+ and npm (for the React client)
+
+### Production-style run (single server)
+
 ```bash
-# 1. Install deps (populates go.sum)
+# 1. Install Go deps (populates go.sum)
 go mod tidy
 
-# 2. Set env vars
+# 2. Build the React client — outputs to web/static/
+cd web/client
+npm install
+npm run build
+cd ../..
+
+# 3. Set env vars
 cp .env.example .env
 # edit .env and set ANTHROPIC_API_KEY + SESSION_SECRET
 export $(grep -v '^#' .env | xargs)
 
-# 3. Run
+# 4. Run the Go server
 go run ./cmd/server/main.go
 # serves on http://localhost:8080
 ```
@@ -25,15 +38,43 @@ go run ./cmd/server/main.go
 Open `http://localhost:8080` in a browser. Add `?mode=lawyer` to enter
 lawyer mode directly, or click "צוות המשרד" in the sidebar.
 
+### Development (hot-reload for the UI)
+
+Run the Go API and the Vite dev server in two terminals:
+
+```bash
+# Terminal 1 — Go API
+export $(grep -v '^#' .env | xargs)
+go run ./cmd/server/main.go        # :8080
+
+# Terminal 2 — Vite dev server with HMR
+cd web/client
+npm install
+npm run dev                        # :5173
+```
+
+Then open `http://localhost:5173`. Vite proxies `/api/*` and `/healthz`
+to the Go server on `:8080`, and the session cookie roundtrips because
+the browser sees both as same-origin from Vite's perspective.
+
 ## Project layout
 
 ```
-cmd/server/main.go              # HTTP entry point, route wiring, graceful shutdown
+cmd/server/main.go              # HTTP entry point, route wiring, graceful shutdown, SPA fallback
 internal/anthropic/             # Minimal Claude Messages API client + system prompt
 internal/chat/                  # HTTP handler, gorilla/sessions integration
 internal/realestatedata/        # data.gov.il fetcher + Hebrew summary formatter
 internal/forms/                 # Static definitions for Israeli gov forms (7002 / 7000 / tabu)
-web/static/                     # RTL Hebrew frontend: index.html, app.js, style.css
+web/client/                     # React + TypeScript + MUI source (Vite)
+  ├── src/
+  │   ├── theme.ts              # MUI theme (RTL, Playfair Display + IBM Plex Sans)
+  │   ├── main.tsx              # Emotion RTL cache + ThemeProvider bootstrap
+  │   ├── api.ts                # fetch wrappers for /api/*
+  │   ├── hooks/useChat.ts      # chat state machine
+  │   └── components/           # Sidebar, ChatArea, MessageBubble, Composer, SuggestedChips
+  ├── index.html                # <html dir="rtl" lang="he">
+  └── vite.config.ts            # builds to ../static, dev proxies /api → :8080
+web/static/                     # Built bundle — output of `npm run build` (served by Go in prod)
 ```
 
 ## API
