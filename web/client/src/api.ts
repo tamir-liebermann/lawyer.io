@@ -72,6 +72,20 @@ export async function extractFormData(req: FormExtractRequest): Promise<FormExtr
   return JSON.parse(text) as FormExtractResponse;
 }
 
+export async function downloadFormPDF(
+  formId: string,
+  values: Record<string, string>,
+): Promise<Blob> {
+  const res = await fetch('/api/forms/pdf', {
+    ...FETCH_OPTS,
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ form_id: formId, values }),
+  });
+  if (!res.ok) throw new Error((await res.text()) || `שגיאה: ${res.status}`);
+  return res.blob();
+}
+
 export async function fetchOffice(): Promise<OfficeConfig> {
   const res = await fetch('/api/office', FETCH_OPTS);
   if (!res.ok) throw new Error(`office fetch: ${res.status}`);

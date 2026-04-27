@@ -19,6 +19,7 @@ import (
 	"github.com/lawyer-io/lawyer/internal/chat"
 	"github.com/lawyer-io/lawyer/internal/forms"
 	"github.com/lawyer-io/lawyer/internal/realestatedata"
+	"github.com/lawyer-io/lawyer/internal/whatsapp"
 )
 
 // staticDir is the directory the Vite build writes to. Go serves it as-is.
@@ -91,9 +92,16 @@ func run() error {
 	mux.HandleFunc("/api/mode", handler.ModeHandler)
 	mux.HandleFunc("/api/forms", formsHandler)
 	mux.HandleFunc("/api/forms/extract", formExtractHandler(llm))
+	mux.HandleFunc("/api/forms/pdf", formPDFHandler)
 	mux.HandleFunc("/api/realestate", realEstateHandler(reFetcher))
 	mux.HandleFunc("/api/office", officeHandler(office))
 	mux.HandleFunc("/api/book", bookHandler(bookingSvc))
+	mux.Handle("/api/whatsapp", &whatsapp.Handler{
+		LLM:        llm,
+		RealEstat:  reFetcher,
+		OfficeName: office.Name,
+		Logger:     logger,
+	})
 	mux.HandleFunc("/healthz", healthz)
 
 	// Static assets + SPA fallback for the React client.
@@ -212,6 +220,35 @@ func formExtractHandler(llm *anthropic.Client) http.HandlerFunc {
 		w.Header().Set("content-type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(resp)
 	}
+}
+
+func formPDFHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		FormID string            `json:"form_id"`
+		Values map[string]string `json:"values"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		http.Error(w, "בקשה לא תקינה", http.StatusBadRequest)
+		return
+	}
+	if body.FormID == "" {
+		http.Error(w, "form_id חסר", http.StatusBadRequest)
+		return
+	}
+	debug := r.URL.Query().Get("debug") == "1"
+	pdf, err := forms.FillPDF(body.FormID, body.Values, debug)
+	if err != nil {
+		log.Printf("formPDF: %v", err)
+		http.Error(w, "שגיאה ביצירת ה-PDF", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+body.FormID+`-filled.pdf"`)
+	_, _ = w.Write(pdf)
 }
 
 func officeHandler(cfg officeConfig) http.HandlerFunc {

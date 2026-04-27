@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import Dialog from '@mui/material/Dialog';
 import DialogTitle from '@mui/material/DialogTitle';
 import DialogContent from '@mui/material/DialogContent';
@@ -6,7 +7,10 @@ import Button from '@mui/material/Button';
 import Typography from '@mui/material/Typography';
 import Box from '@mui/material/Box';
 import Chip from '@mui/material/Chip';
+import CircularProgress from '@mui/material/CircularProgress';
 import DownloadIcon from '@mui/icons-material/Download';
+import PictureAsPdfIcon from '@mui/icons-material/PictureAsPdf';
+import { downloadFormPDF } from '../api';
 import type { FormExtractResponse } from '../types';
 
 interface Props {
@@ -16,6 +20,8 @@ interface Props {
 }
 
 export default function FormExportModal({ open, result, onClose }: Props) {
+  const [pdfLoading, setPdfLoading] = useState(false);
+
   if (!result) return null;
 
   const handleDownload = () => {
@@ -27,6 +33,23 @@ export default function FormExportModal({ open, result, onClose }: Props) {
     a.download = `${result.form_id}.json`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadPDF = async () => {
+    setPdfLoading(true);
+    try {
+      const blob = await downloadFormPDF(result.form_id, result.values);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${result.form_id}-filled.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      /* ignore */
+    } finally {
+      setPdfLoading(false);
+    }
   };
 
   return (
@@ -67,6 +90,15 @@ export default function FormExportModal({ open, result, onClose }: Props) {
       <DialogActions sx={{ px: 3, pb: 2.5, gap: 1 }}>
         <Button onClick={onClose} color="inherit">
           סגור
+        </Button>
+        <Button
+          onClick={handleDownloadPDF}
+          variant="outlined"
+          disabled={pdfLoading}
+          startIcon={pdfLoading ? <CircularProgress size={16} /> : <PictureAsPdfIcon />}
+          sx={{ minWidth: 140 }}
+        >
+          הורד PDF
         </Button>
         <Button
           onClick={handleDownload}

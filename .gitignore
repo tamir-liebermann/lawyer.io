@@ -28,3 +28,6 @@ npm-debug.log*
 # deployments don't need Node installed.
 web/static/assets/
 web/static/index.html
+
+# pdfcpu user-font cache (generated at runtime).
+*.gob
